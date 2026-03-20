@@ -11,6 +11,23 @@ export default function Logs() {
   const [agentAttempts, setAgentAttempts] = useState<Attempt[]>([]);
   const [loading, setLoading] = useState(false);
   const logPanelRef = useRef<HTMLDivElement>(null);
+  const userHasScrolled = useRef(false);
+  const prevSelectedAgent = useRef<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchInFlight = useRef(false);
+
+  // Track when user scrolls away from bottom
+  useEffect(() => {
+    const el = logPanelRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      userHasScrolled.current = !atBottom;
+    };
+    el.addEventListener("scroll", onScroll);
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
 
   // Load agent list + status
   useEffect(() => {
@@ -22,34 +39,60 @@ export default function Logs() {
     api.status().then(setStatus).catch(() => {});
   }, []);
 
-  // Fetch logs + attempts for selected agent
+  // Fetch logs + attempts for selected agent (debounced, with abort)
   const fetchAgentData = useCallback((agentId: string) => {
-    api.logs(agentId).then(setLogData).catch(() => {});
+    if (fetchInFlight.current) return; // skip if already fetching
+    fetchInFlight.current = true;
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    api.logs(agentId, ac.signal)
+      .then(setLogData)
+      .catch(() => {})
+      .finally(() => { fetchInFlight.current = false; });
     api.agentAttempts(agentId).then(setAgentAttempts).catch(() => setAgentAttempts([]));
   }, []);
 
   // Reset and load when agent changes
   useEffect(() => {
     if (!selectedAgent) return;
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    fetchInFlight.current = false;
     setLogData(null); // eslint-disable-line react-hooks/set-state-in-effect -- reset before fetch
     setLoading(true);
-    api.logs(selectedAgent).then((data) => {
+    api.logs(selectedAgent, ac.signal).then((data) => {
       setLogData(data);
       setLoading(false);
     }).catch(() => setLoading(false));
     api.agentAttempts(selectedAgent).then(setAgentAttempts).catch(() => setAgentAttempts([]));
+    return () => ac.abort();
   }, [selectedAgent]);
 
-  // Scroll to bottom when log data loads
+  // Scroll to bottom only on initial load or agent switch
   useEffect(() => {
     if (!logData) return;
-    requestAnimationFrame(() => {
-      logPanelRef.current?.scrollTo({ top: logPanelRef.current.scrollHeight });
-    });
-  }, [logData]);
+    const agentChanged = selectedAgent !== prevSelectedAgent.current;
+    if (agentChanged) {
+      prevSelectedAgent.current = selectedAgent;
+      userHasScrolled.current = false;
+    }
+    if (!userHasScrolled.current) {
+      requestAnimationFrame(() => {
+        logPanelRef.current?.scrollTo({ top: logPanelRef.current.scrollHeight });
+      });
+    }
+  }, [logData, selectedAgent]);
 
   useSSE({
-    "log:update": () => { if (selectedAgent) fetchAgentData(selectedAgent); },
+    "log:update": () => {
+      // Debounce: coalesce rapid SSE updates into one fetch
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      refreshTimer.current = setTimeout(() => {
+        if (selectedAgent) fetchAgentData(selectedAgent);
+      }, 2000);
+    },
     "attempt:new": () => {
       api.status().then(setStatus).catch(() => {});
       if (selectedAgent) api.agentAttempts(selectedAgent).then(setAgentAttempts).catch(() => {});
