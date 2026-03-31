@@ -72,6 +72,8 @@ class OpenCodeRuntime:
         prompt_source: str | None = None,
         task_name: str | None = None,
         task_description: str | None = None,
+        gateway_url: str | None = None,
+        gateway_api_key: str | None = None,
     ) -> AgentHandle:
         """Start an OpenCode agent in the given worktree."""
         agent_id_file = worktree_path / ".coral_agent_id"
@@ -92,6 +94,10 @@ class OpenCodeRuntime:
                 prompt = "Begin."
 
         # Build command: opencode run [flags] <prompt>
+        # Keep the full provider/model format (e.g. "minimax/MiniMax-M2.5")
+        # so OpenCode knows which provider to use. When the gateway is active,
+        # the provider's baseURL is patched in opencode.json to route through
+        # the LiteLLM proxy.
         cmd = [
             "opencode", "run",
             "--model", model,
@@ -109,6 +115,13 @@ class OpenCodeRuntime:
 
         agent_env = _clean_env()
         agent_env["UV_PROJECT_ENVIRONMENT"] = str(worktree_path / ".venv")
+
+        # Route through gateway if configured
+        if gateway_url:
+            agent_env["OPENAI_BASE_URL"] = gateway_url
+            logger.info(f"OpenCode agent {agent_id}: routing via gateway at {gateway_url}")
+        if gateway_api_key:
+            agent_env["OPENAI_API_KEY"] = gateway_api_key
 
         log_file = open(log_path, "w", buffering=1)
 
