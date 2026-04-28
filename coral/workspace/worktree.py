@@ -293,18 +293,18 @@ def setup_opencode_settings(
         provider_options: dict[str, str] = {"baseURL": gateway_url}
         if gateway_api_key:
             provider_options["apiKey"] = gateway_api_key
+        # Custom provider name "vllm" + @ai-sdk/openai-compatible package
+        # routes opencode through chat/completions instead of the Responses API.
+        # Model id "Qwen3-8B" matches vLLM's served_model_name.
         settings["provider"] = {
-            "openai": {
-                "npm": "@ai-sdk/openai",
-                "name": "openai",
+            "vllm": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "vllm",
                 "options": provider_options,
                 "models": {
-                    "gpt-5.4": {
-                        "name": "gpt-5.4"
+                    "Qwen3-8B": {
+                        "name": "Qwen3-8B"
                     },
-                    "claude-opus-4-6": {
-                        "name": "claude-opus-4-6"
-                    }
                 }
             },
         }
