@@ -289,13 +289,29 @@ def setup_opencode_settings(
         },
     }
 
-    if gateway_url:
-        provider_options: dict[str, str] = {"baseURL": gateway_url}
+    # Resolve the agent's baseURL. Priority:
+    #   1. CORAL_VLLM_POOL env var (per-agent direct vLLM binding, gateway bypassed)
+    #   2. gateway_url passed in (CORAL-spawned LiteLLM gateway)
+    #   3. None — no provider config written; opencode uses defaults.
+    provider_options: dict[str, str] | None = None
+    pool_env = os.environ.get("CORAL_VLLM_POOL", "")
+    if pool_env:
+        import re
+        pool = [u.strip() for u in pool_env.split(",") if u.strip()]
+        m = re.search(r"\d+", worktree_path.name)
+        if pool and m:
+            provider_options = {
+                "baseURL": pool[(int(m.group()) - 1) % len(pool)],
+                "apiKey": "EMPTY",
+            }
+    elif gateway_url:
+        provider_options = {"baseURL": gateway_url}
         if gateway_api_key:
             provider_options["apiKey"] = gateway_api_key
+
+    if provider_options:
         # Custom provider name "vllm" + @ai-sdk/openai-compatible package
         # routes opencode through chat/completions instead of the Responses API.
-        # Model id "Qwen3-8B" matches vLLM's served_model_name.
         settings["provider"] = {
             "vllm": {
                 "npm": "@ai-sdk/openai-compatible",
@@ -304,6 +320,9 @@ def setup_opencode_settings(
                 "models": {
                     "Qwen3-8B": {
                         "name": "Qwen3-8B"
+                    },
+                    "Qwen3-Coder-30B": {
+                        "name": "Qwen3-Coder-30B"
                     },
                 }
             },
