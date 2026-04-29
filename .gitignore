@@ -95,3 +95,7 @@ examples/frontier_cs_research/task_dynamic.yaml
 examples/apex-frontier
 examples/apex-prelim
 examples/deepresearch_bench
+
+# Locally downloaded benchmark data (do not commit)
+examples/ADRS/eplb/eval/expert-load.json
+examples/ADRS/llm_sql/eval/datasets/
