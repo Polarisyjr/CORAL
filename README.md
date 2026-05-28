@@ -292,6 +292,26 @@ coral/
 
 ### Using OpenCode
 
+#### Prerequisites
+
+OpenCode has three host-side requirements that are *not* fetched by `uv sync`:
+
+| Requirement | Why |
+|---|---|
+| `tmux` | CORAL's default `run.session=tmux` launcher (use `run.session=local` to skip) |
+| `opencode` CLI | the agent binary itself (installed to `~/.opencode/bin/opencode`) |
+| `bun` + `@ai-sdk/openai-compatible` (or `@ai-sdk/anthropic`, …) | OpenCode loads any provider declared as `"npm": "..."` in `opencode.json` from `~/.config/opencode/node_modules/`. **Without `bun` on `PATH` and the package pre-installed, OpenCode silently parses the provider config but never registers the provider** — every request then fails with `Model not found: <provider>/<model>.` and the CORAL agent enters a restart loop. (`opencode debug config` still shows the provider as if it were loaded, which makes this hard to diagnose; check the server log at `~/.local/share/opencode/log/` — you should see `service=provider providerID=<your-provider> found`. If only `providerID=opencode found` appears, the npm package is missing.) |
+
+The repo ships an idempotent installer that handles all three:
+
+```bash
+bash setup_opencode.sh
+```
+
+Edit the `PROVIDER_PKGS` array at the top of the script if you use a provider other than `@ai-sdk/openai-compatible`.
+
+#### Configuring opencode.json
+
 To use [OpenCode](https://github.com/opencode-ai/opencode) as your agent runtime, you need to provide an `opencode.json` configuration file in your seed directory. This file configures OpenCode's permissions and provider settings.
 
 Here is an example from `examples/circle_packing/seed/opencode.json`:
