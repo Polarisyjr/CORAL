@@ -98,8 +98,14 @@ class OpenCodeRuntime:
         # so OpenCode knows which provider to use. When the gateway is active,
         # the provider's baseURL is patched in opencode.json to route through
         # the LiteLLM proxy.
+        # --dir is required: without it, opencode (under non-tty stdin) walks
+        # up the directory tree past the agent worktree to the enclosing git
+        # repo root, where the per-agent `vllm` provider in
+        # `<worktree>/.opencode/opencode.json` is not registered — every call
+        # then fails with `Model not found: vllm/<model>`.
         cmd = [
             "opencode", "run",
+            "--dir", str(worktree_path),
             "--model", model,
             "--format", "json",
         ]
