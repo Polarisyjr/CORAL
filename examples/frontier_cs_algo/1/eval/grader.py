@@ -42,4 +42,21 @@ class Grader(TaskGrader):
             return self.score(0.0, feedback=msg)
 
         score = result.score if result.score is not None else 0.0
-        return self.score(score, feedback=f"Score: {score:.2f}/100")
+
+        # Surface the judge's own diagnostics so the agent can debug a 0/low
+        # score instead of flying blind. This changes only the feedback string
+        # shown to the agent (never the score) and exposes no answer keys — just
+        # the checker's verdict and the first failing test case's message (e.g.
+        # malformed output, constraint violation, runtime error).
+        feedback = f"Score: {score:.2f}/100"
+        meta = result.metadata or {}
+        verdict = meta.get("result")
+        if verdict and verdict != "Accepted":
+            feedback += f" | judge verdict: {verdict}"
+        for case in meta.get("cases") or []:
+            if not case.get("ok", True):
+                cmsg = (case.get("msg") or "").strip().replace("\n", " ")
+                if cmsg:
+                    feedback += f" | first failing case ({case.get('status', 'fail')}): {cmsg[:240]}"
+                break
+        return self.score(score, feedback=feedback)

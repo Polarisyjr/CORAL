@@ -105,7 +105,12 @@ def copy_eval_to_private(task_dir: Path, coral_dir: Path) -> None:
     eval_dst = coral_dir / "private" / "eval"
     if eval_dst.exists():
         shutil.rmtree(eval_dst)
-    shutil.copytree(eval_src, eval_dst)
+    # Some tasks (e.g. frontier_cs_algo) ship eval/ dirs containing symlinks to
+    # test data that may be dangling on this host (the checked-in symlinks use
+    # absolute paths from the task author's machine). Copy symlinks as-is and
+    # skip dangling ones rather than aborting the whole project setup — the
+    # active grader (frontier_cs SingleEvaluator -> go-judge) doesn't read them.
+    shutil.copytree(eval_src, eval_dst, symlinks=True, ignore_dangling_symlinks=True)
     logger.info(f"Copied eval/ to .coral/private/eval/ ({sum(1 for _ in eval_dst.rglob('*') if _.is_file())} files)")
 
 
