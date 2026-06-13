@@ -129,6 +129,29 @@ class OpenCodeRuntime:
         venv_bin = str(worktree_path / ".venv" / "bin")
         agent_env["PATH"] = venv_bin + ":" + agent_env.get("PATH", "")
 
+        # Per-agent OpenCode data dir. OpenCode keeps its session store
+        # (SQLite: $XDG_DATA_HOME/opencode/opencode.db) under XDG_DATA_HOME,
+        # defaulting to ~/.local/share. Without an override every concurrent
+        # agent on the host shares ONE opencode.db and serializes on its single
+        # SQLite write lock; past ~60 concurrent agents most of them hang/fail
+        # at session creation ("SQLiteError: database is locked" ->
+        # LockTimeoutError) before their first turn, so they never call the
+        # model. Isolating the data dir per worktree removes that contention.
+        opencode_data = worktree_path / ".opencode_data"
+        opencode_data.mkdir(parents=True, exist_ok=True)
+        agent_env["XDG_DATA_HOME"] = str(opencode_data)
+
+        # Disable OpenCode's filesystem watcher. Each agent's watcher opens an
+        # inotify instance, and the kernel caps these at
+        # fs.inotify.max_user_instances (default 128 per user). Past ~60
+        # concurrent agents that budget is exhausted, so the rest block forever
+        # at watcher init (last log line: "watcher backend ... backend=inotify")
+        # and never reach their first model call. The watcher only drives
+        # interactive/TUI live-reload, which headless `opencode run` agents don't
+        # use — so disabling it lifts the concurrency ceiling without a host
+        # sysctl change.
+        agent_env["OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER"] = "true"
+
         # Route through gateway if configured
         if gateway_url:
             agent_env["OPENAI_BASE_URL"] = gateway_url
