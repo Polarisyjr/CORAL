@@ -99,3 +99,6 @@ examples/deepresearch_bench
 # Locally downloaded benchmark data (do not commit)
 examples/ADRS/eplb/eval/expert-load.json
 examples/ADRS/llm_sql/eval/datasets/
+
+
+_version.py
