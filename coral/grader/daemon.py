@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,6 +45,16 @@ _POLL_INTERVAL_SEC = 0.5
 # --------------------------------------------------------------------------- #
 # Subprocess wrapper around the grader (keeps hard-kill semantics on timeout) #
 # --------------------------------------------------------------------------- #
+
+# Grader children are spawned, NOT forked. The daemon grades a batch with a
+# ThreadPoolExecutor, so multiple threads may start a grader child concurrently.
+# fork() in a multi-threaded process is unsafe: the child inherits every lock in
+# its *held* state but only the forking thread, so a grader that touches an
+# import / malloc / logging lock another worker held at fork time deadlocks
+# forever (observed with graders that `import networkx/pandas`). spawn starts a
+# fresh interpreter with no inherited lock state.
+_MP = multiprocessing.get_context("spawn")
+
 
 def _grader_worker(
     config_path: str,
@@ -94,8 +104,8 @@ def _run_grader_with_timeout(
         grader = load_grader(config, coral_dir=coral_dir)
         return asyncio.run(grader.grade(codebase_path, tasks))
 
-    result_queue: multiprocessing.Queue = multiprocessing.Queue()
-    proc = multiprocessing.Process(
+    result_queue: multiprocessing.Queue = _MP.Queue()
+    proc = _MP.Process(
         target=_grader_worker,
         args=(config_path, coral_dir, codebase_path, tasks, result_queue),
     )
@@ -420,36 +430,44 @@ def run_daemon(coral_dir: str | Path, stop_event: Any = None) -> None:
         logger.info("Grading in parallel with %d workers", n_workers)
     pool = ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="grader")
 
+    # Stream submissions instead of grading in synchronized batches. A single
+    # slow/stuck grader — e.g. an agent program that makes networkx enumerate
+    # exponentially many paths, which blocks until the grader timeout — must NOT
+    # freeze the loop; it should occupy only its own worker while siblings keep
+    # getting graded. `inflight` maps commit_hash -> Future so we never resubmit
+    # an attempt that's already grading (it stays `pending` on disk until done).
+    inflight: dict[str, Any] = {}
+
     try:
         while not _should_stop():
+            # Reap finished gradings: free the slot and surface any logged error.
+            for h in [h for h, fut in inflight.items() if fut.done()]:
+                inflight.pop(h).result()  # _grade_one_guarded never raises
+
             try:
                 pending = _find_pending(coral_dir)
             except Exception:
                 logger.exception("Failed to scan for pending attempts")
                 pending = []
 
-            if not pending:
-                # Idle heartbeat so supervisors can tell the daemon is alive.
-                try:
-                    heartbeat_file.write_text(datetime.now(UTC).isoformat())
-                except OSError:
-                    pass
-                time.sleep(_POLL_INTERVAL_SEC)
-                continue
-
-            # Grade this batch concurrently. _grade_one_guarded never raises, so
-            # one bad attempt can't kill the daemon or its siblings.
-            futures = []
+            # Submit every pending attempt not already in flight. Excess over
+            # n_workers queues inside the pool; a stuck worker doesn't hold the
+            # others back.
             for attempt in pending:
                 if _should_stop():
                     break
-                futures.append(
-                    pool.submit(
+                if attempt.commit_hash not in inflight:
+                    inflight[attempt.commit_hash] = pool.submit(
                         _grade_one_guarded, attempt, config_path, coral_dir, config
                     )
-                )
-            for fut in as_completed(futures):
-                fut.result()
+
+            # Heartbeat every tick (busy or idle) so supervisors see liveness even
+            # while a long grading is in flight.
+            try:
+                heartbeat_file.write_text(datetime.now(UTC).isoformat())
+            except OSError:
+                pass
+            time.sleep(_POLL_INTERVAL_SEC)
     finally:
         pool.shutdown(wait=True)
 

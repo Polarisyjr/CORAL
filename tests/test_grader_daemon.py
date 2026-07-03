@@ -445,3 +445,86 @@ def test_run_daemon_grades_batch_in_parallel():
         finally:
             sys.path.pop(0)
             os.environ.pop("GRADE_MARKER_DIR", None)
+
+
+def test_run_daemon_stuck_grade_does_not_freeze_others():
+    """A single stuck grading must not starve sibling attempts.
+
+    Regression for the batch-barrier bug: the daemon used to submit a batch and
+    block on as_completed(), so one attempt whose grader hangs (e.g. an agent
+    program that makes networkx enumerate exponentially many paths) froze the
+    whole loop and every later pending attempt was never graded. The streaming
+    loop must keep grading siblings while the stuck one occupies just its worker.
+    """
+    import os
+
+    hang_s = 20.0  # the stuck grader sleeps far longer than the assert window
+    with tempfile.TemporaryDirectory() as d:
+        repo = _init_repo_and_coral(Path(d), score=0.5)
+        # Grader hangs iff the graded code contains the HANG marker.
+        eval_dir = repo / ".coral" / "private" / "eval"
+        (eval_dir / "grader.py").write_text(
+            "import time\n"
+            "from pathlib import Path\n"
+            "from coral.grader.task_grader import TaskGrader\n"
+            "class Grader(TaskGrader):\n"
+            "    def evaluate(self):\n"
+            "        if 'HANG' in Path(self.codebase_path, 'main.py').read_text():\n"
+            f"            time.sleep({hang_s!r})\n"
+            "        return 0.5\n"
+        )
+        cfg_path = repo / ".coral" / "config.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text())
+        cfg["grader"]["workers"] = 3
+        cfg["grader"]["timeout"] = 60  # > hang_s, so the stuck one isn't killed early
+        cfg_path.write_text(yaml.dump(cfg))
+
+        sys.path.insert(0, str(repo))
+        os.environ["PYTHONPATH"] = (
+            str(repo) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        )
+        try:
+            # Submit the hanging attempt FIRST, then two fast siblings.
+            (repo / "main.py").write_text("print('HANG')\n")
+            stuck = submit_eval(message="stuck", agent_id="agent-1",
+                                workdir=str(repo), wait=False)
+            fast = []
+            for i in range(2):
+                (repo / "main.py").write_text(f"print('fast{i}')\n")
+                fast.append(submit_eval(message=f"fast{i}", agent_id="agent-1",
+                                        workdir=str(repo), wait=False))
+
+            stop_event = multiprocessing.Event()
+            proc = multiprocessing.Process(
+                target=run_daemon, args=(str(repo / ".coral"), stop_event),
+            )
+            proc.start()
+            try:
+                # Well within hang_s: the fast siblings must finish while the
+                # stuck grading is still sleeping.
+                deadline = time.monotonic() + 12.0
+                while time.monotonic() < deadline:
+                    fin = [read_attempt(repo / ".coral", p.commit_hash) for p in fast]
+                    if all(f and f.status != "pending" for f in fin):
+                        break
+                    time.sleep(0.1)
+                fast_final = [read_attempt(repo / ".coral", p.commit_hash) for p in fast]
+                stuck_final = read_attempt(repo / ".coral", stuck.commit_hash)
+            finally:
+                stop_event.set()
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=5)
+                proc.close()
+
+            # Siblings graded despite the stuck one still hanging (== not frozen).
+            assert all(f and f.status != "pending" for f in fast_final), (
+                "fast attempts were starved by the stuck grading — loop froze"
+            )
+            assert all(f.score == 0.5 for f in fast_final)
+            assert stuck_final is not None and stuck_final.status == "pending", (
+                "stuck grading should still be in flight (sleeping), not finished"
+            )
+        finally:
+            sys.path.pop(0)
