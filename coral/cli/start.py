@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -64,6 +65,32 @@ def _tmux_env() -> dict[str, str]:
     return env
 
 
+# Env vars our launchers set (e.g. coral-vllm.sh exports CORAL_VLLM_POOL) that
+# MUST survive into the tmux session. `env=` on `tmux new-session` only sets the
+# tmux *client* env; when a tmux server is already running it spawns the session
+# command with the SERVER's environment (refreshing only its update-environment
+# allowlist), so these non-standard vars are silently dropped and per-agent vLLM
+# provider config never gets written. Bake them into the command with an explicit
+# `env VAR=VAL ...` prefix so they hold regardless of server state.
+_TMUX_FORWARD_ENV = (
+    "CORAL_VLLM_POOL",
+    "CORAL_POOL_CFG",
+    "CORAL_GATEWAY_URL",
+    "CORAL_GATEWAY_API_KEY",
+    "PATH",
+)
+
+
+def _tmux_env_prefix() -> str:
+    """`env VAR=VAL ...` prefix forwarding _TMUX_FORWARD_ENV into the session."""
+    parts = []
+    for var in _TMUX_FORWARD_ENV:
+        val = os.environ.get(var)
+        if val is not None:
+            parts.append(f"{var}={shlex.quote(val)}")
+    return ("env " + " ".join(parts) + " ") if parts else ""
+
+
 def _build_coral_command(args: argparse.Namespace) -> list[str]:
     """Reconstruct the coral start command with run.session=local added."""
     cmd = [_resolved_python(), "-m", "coral.cli", "start"]
@@ -81,7 +108,7 @@ def _start_in_tmux(args: argparse.Namespace, config: CoralConfig) -> None:
     session_name = f"coral-{task_name}-{timestamp}"
 
     coral_cmd = _build_coral_command(args)
-    shell_cmd = " ".join(f"'{c}'" if " " in c else c for c in coral_cmd)
+    shell_cmd = _tmux_env_prefix() + shlex.join(coral_cmd)
 
     result = subprocess.run(
         ["tmux", "new-session", "-d", "-s", session_name, shell_cmd],
