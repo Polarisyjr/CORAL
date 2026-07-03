@@ -330,3 +330,118 @@ def test_run_daemon_subprocess_grades_pending():
         finally:
             sys.path.pop(0)
             _ = env_shim  # silence linter
+
+
+# --------------------------------------------------------------------------- #
+# Parallel grading — run_daemon grades a batch concurrently (grader.workers)   #
+# --------------------------------------------------------------------------- #
+
+def test_run_daemon_grades_batch_in_parallel():
+    """grader.workers>1 grades a pending batch concurrently.
+
+    Correctness: every attempt is scored once and the eval counter is exact (no
+    lost increments under the read-modify-write race). Concurrency is proven by
+    overlap, not wall-time ratios (immune to machine load): each grader stamps
+    its own [start, end] execution window, and we assert max(starts) < min(ends)
+    — i.e. at some instant all n graders were running at once, which a serial
+    daemon can never produce.
+    """
+    import os
+
+    n = 3
+    sleep_s = 1.5
+    with tempfile.TemporaryDirectory() as d:
+        repo = _init_repo_and_coral(Path(d), score=0.7)
+        marker_dir = Path(d) / "markers"
+        marker_dir.mkdir()
+
+        # Grader stamps a per-process [start, end] window, then returns a score.
+        eval_dir = repo / ".coral" / "private" / "eval"
+        (eval_dir / "grader.py").write_text(
+            "import os, time\n"
+            "from coral.grader.task_grader import TaskGrader\n"
+            "class Grader(TaskGrader):\n"
+            "    def evaluate(self):\n"
+            "        d = os.environ['GRADE_MARKER_DIR']\n"
+            "        t0 = time.time()\n"
+            f"        time.sleep({sleep_s!r})\n"
+            "        t1 = time.time()\n"
+            "        with open(os.path.join(d, str(os.getpid())), 'w') as f:\n"
+            "            f.write(f'{t0} {t1}')\n"
+            "        return 0.7\n"
+        )
+        cfg_path = repo / ".coral" / "config.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text())
+        cfg["grader"]["workers"] = n
+        cfg_path.write_text(yaml.dump(cfg))
+
+        sys.path.insert(0, str(repo))
+        os.environ["PYTHONPATH"] = (
+            str(repo) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        )
+        os.environ["GRADE_MARKER_DIR"] = str(marker_dir)
+        try:
+            pendings = []
+            for i in range(n):
+                (repo / "main.py").write_text(f"print('v{i}')\n")
+                pendings.append(
+                    submit_eval(
+                        message=f"c{i}", agent_id="agent-1",
+                        workdir=str(repo), wait=False,
+                    )
+                )
+            assert len(_find_pending(repo / ".coral")) == n
+
+            stop_event = multiprocessing.Event()
+            proc = multiprocessing.Process(
+                target=run_daemon, args=(str(repo / ".coral"), stop_event),
+            )
+            proc.start()
+            try:
+                deadline = time.monotonic() + 60.0
+                while time.monotonic() < deadline:
+                    finals = [
+                        read_attempt(repo / ".coral", p.commit_hash) for p in pendings
+                    ]
+                    if all(f and f.status != "pending" for f in finals):
+                        break
+                    time.sleep(0.1)
+            finally:
+                stop_event.set()
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=5)
+                proc.close()
+
+            # Correctness: every attempt scored exactly once, right value.
+            finals = [read_attempt(repo / ".coral", p.commit_hash) for p in pendings]
+            assert all(f is not None and f.status != "pending" for f in finals)
+            assert all(f.score == 0.7 for f in finals)
+
+            # Eval counter exact — the _COUNT_LOCK prevents lost increments.
+            count = int((repo / ".coral" / "public" / "eval_count").read_text().strip())
+            assert count == n, f"eval_count={count}, expected {n} (lost increments?)"
+
+            # Concurrency: at least two grader execution windows overlap in time.
+            # A serial daemon produces strictly non-overlapping windows (each
+            # grader starts only after the previous finishes), so any overlap
+            # proves grading ran in parallel. Requiring only a pair (not all n)
+            # keeps this immune to a single straggler under CPU contention.
+            windows = []
+            for m in marker_dir.iterdir():
+                t0, t1 = (float(x) for x in m.read_text().split())
+                windows.append((t0, t1))
+            assert len(windows) == n, f"{len(windows)} markers, expected {n}"
+            has_overlap = any(
+                a[0] < b[1] and b[0] < a[1]
+                for i, a in enumerate(windows)
+                for b in windows[i + 1:]
+            )
+            assert has_overlap, (
+                f"no two grader windows overlapped (windows={windows}) "
+                "— grading ran serially"
+            )
+        finally:
+            sys.path.pop(0)
+            os.environ.pop("GRADE_MARKER_DIR", None)

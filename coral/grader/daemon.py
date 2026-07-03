@@ -19,8 +19,10 @@ import logging
 import multiprocessing
 import shutil
 import subprocess
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -151,6 +153,15 @@ def _is_git_repo(path: Path) -> bool:
     return path.is_dir() and (path / ".git").exists()
 
 
+# Serializes git worktree metadata ops (add/remove/prune) across parallel
+# graders so they don't race on .git/worktrees or index.lock. Only the fast git
+# calls are held under this lock; the actual grading runs fully concurrent.
+_WORKTREE_LOCK = threading.Lock()
+# Guards the read-modify-write of the global eval counter (increment_eval_count
+# is not atomic on its own, so parallel graders would otherwise lose counts).
+_COUNT_LOCK = threading.Lock()
+
+
 def _add_isolated_worktree(repo_dir: Path, commit_hash: str, dest: Path) -> None:
     """Create a detached worktree at `dest` pointing at `commit_hash`.
 
@@ -159,10 +170,11 @@ def _add_isolated_worktree(repo_dir: Path, commit_hash: str, dest: Path) -> None
     if dest.exists():
         _remove_worktree(repo_dir, dest)
 
-    result = subprocess.run(
-        ["git", "worktree", "add", "--detach", str(dest), commit_hash],
-        capture_output=True, text=True, cwd=str(repo_dir),
-    )
+    with _WORKTREE_LOCK:
+        result = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(dest), commit_hash],
+            capture_output=True, text=True, cwd=str(repo_dir),
+        )
     if result.returncode != 0:
         raise RuntimeError(
             f"git worktree add --detach {commit_hash[:12]} failed: {result.stderr.strip()}"
@@ -172,10 +184,11 @@ def _add_isolated_worktree(repo_dir: Path, commit_hash: str, dest: Path) -> None
 def _remove_worktree(repo_dir: Path, dest: Path) -> None:
     """Remove a worktree. Best-effort; logs on failure but does not raise."""
     # git worktree remove is the preferred path; fall back to rmtree + prune.
-    result = subprocess.run(
-        ["git", "worktree", "remove", "--force", str(dest)],
-        capture_output=True, text=True, cwd=str(repo_dir),
-    )
+    with _WORKTREE_LOCK:
+        result = subprocess.run(
+            ["git", "worktree", "remove", "--force", str(dest)],
+            capture_output=True, text=True, cwd=str(repo_dir),
+        )
     if result.returncode != 0:
         logger.warning(
             "git worktree remove %s failed (rc=%d): %s — falling back to rmtree",
@@ -186,10 +199,11 @@ def _remove_worktree(repo_dir: Path, dest: Path) -> None:
                 shutil.rmtree(dest)
         except OSError as e:
             logger.warning("rmtree %s failed: %s", dest, e)
-        subprocess.run(
-            ["git", "worktree", "prune"],
-            capture_output=True, text=True, cwd=str(repo_dir),
-        )
+        with _WORKTREE_LOCK:
+            subprocess.run(
+                ["git", "worktree", "prune"],
+                capture_output=True, text=True, cwd=str(repo_dir),
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -297,7 +311,8 @@ def _grade_one(
         metadata=metadata,
     )
     write_attempt(str(coral_dir), finalized)
-    count = increment_eval_count(coral_dir)
+    with _COUNT_LOCK:
+        count = increment_eval_count(coral_dir)
     logger.info(
         "Graded #%d %s -> score=%s status=%s",
         count, attempt.commit_hash[:12],
@@ -334,6 +349,44 @@ def process_pending_once(coral_dir: str | Path) -> list[Attempt]:
     return finalized
 
 
+def _grade_one_guarded(
+    attempt: Attempt,
+    config_path: Path,
+    coral_dir: Path,
+    config: CoralConfig,
+) -> None:
+    """`_grade_one` wrapped so no error escapes — safe to run in a pool worker.
+
+    `_grade_one` already finalizes known failure modes as timeout/crashed; this
+    catch-all only fires for truly unexpected errors and records a crash so the
+    attempt doesn't sit pending forever.
+    """
+    try:
+        _grade_one(attempt, config_path, coral_dir, config)
+    except Exception:
+        logger.exception(
+            "Unhandled error grading %s; marking crashed", attempt.commit_hash[:12]
+        )
+        try:
+            crashed = Attempt(
+                commit_hash=attempt.commit_hash,
+                agent_id=attempt.agent_id,
+                title=attempt.title,
+                score=None,
+                status="crashed",
+                parent_hash=attempt.parent_hash,
+                timestamp=attempt.timestamp,
+                feedback="Grader daemon hit an unexpected error; see logs.",
+                shared_state_hash=attempt.shared_state_hash,
+                parent_shared_state_hash=attempt.parent_shared_state_hash,
+            )
+            write_attempt(str(coral_dir), crashed)
+            with _COUNT_LOCK:
+                increment_eval_count(coral_dir)
+        except Exception:
+            logger.exception("Failed to record crash for %s", attempt.commit_hash[:12])
+
+
 def run_daemon(coral_dir: str | Path, stop_event: Any = None) -> None:
     """Watch coral_dir/public/attempts/ and grade pending entries.
 
@@ -358,51 +411,46 @@ def run_daemon(coral_dir: str | Path, stop_event: Any = None) -> None:
     def _should_stop() -> bool:
         return bool(stop_event and stop_event.is_set())
 
-    while not _should_stop():
-        try:
-            pending = _find_pending(coral_dir)
-        except Exception:
-            logger.exception("Failed to scan for pending attempts")
-            pending = []
+    # Parallel grading: default to agents.count workers (grader.workers overrides;
+    # set it to 1 for graders that aren't concurrency-safe — Docker ports, GPU,
+    # shared scratch). Each attempt grades in its own detached worktree, so the
+    # only shared state is git metadata + the eval counter, both lock-guarded.
+    n_workers = max(1, config.grader.workers or config.agents.count)
+    if n_workers > 1:
+        logger.info("Grading in parallel with %d workers", n_workers)
+    pool = ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="grader")
 
-        if not pending:
-            # Idle heartbeat so supervisors can tell the daemon is alive.
+    try:
+        while not _should_stop():
             try:
-                heartbeat_file.write_text(datetime.now(UTC).isoformat())
-            except OSError:
-                pass
-            time.sleep(_POLL_INTERVAL_SEC)
-            continue
-
-        for attempt in pending:
-            if _should_stop():
-                break
-            try:
-                _grade_one(attempt, config_path, coral_dir, config)
+                pending = _find_pending(coral_dir)
             except Exception:
-                # Catch-all: never let a bad grade kill the daemon. The per-attempt
-                # handler already finalized the record as "crashed" on any known
-                # failure mode; this only fires for truly unexpected errors.
-                logger.exception(
-                    "Unhandled error grading %s; marking crashed",
-                    attempt.commit_hash[:12],
-                )
+                logger.exception("Failed to scan for pending attempts")
+                pending = []
+
+            if not pending:
+                # Idle heartbeat so supervisors can tell the daemon is alive.
                 try:
-                    crashed = Attempt(
-                        commit_hash=attempt.commit_hash,
-                        agent_id=attempt.agent_id,
-                        title=attempt.title,
-                        score=None,
-                        status="crashed",
-                        parent_hash=attempt.parent_hash,
-                        timestamp=attempt.timestamp,
-                        feedback="Grader daemon hit an unexpected error; see logs.",
-                        shared_state_hash=attempt.shared_state_hash,
-                        parent_shared_state_hash=attempt.parent_shared_state_hash,
+                    heartbeat_file.write_text(datetime.now(UTC).isoformat())
+                except OSError:
+                    pass
+                time.sleep(_POLL_INTERVAL_SEC)
+                continue
+
+            # Grade this batch concurrently. _grade_one_guarded never raises, so
+            # one bad attempt can't kill the daemon or its siblings.
+            futures = []
+            for attempt in pending:
+                if _should_stop():
+                    break
+                futures.append(
+                    pool.submit(
+                        _grade_one_guarded, attempt, config_path, coral_dir, config
                     )
-                    write_attempt(str(coral_dir), crashed)
-                    increment_eval_count(coral_dir)
-                except Exception:
-                    logger.exception("Failed to record crash for %s", attempt.commit_hash[:12])
+                )
+            for fut in as_completed(futures):
+                fut.result()
+    finally:
+        pool.shutdown(wait=True)
 
     logger.info("Grader daemon stopped")

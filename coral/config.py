@@ -33,6 +33,7 @@ class GraderConfig:
         default_factory=list
     )  # files/dirs copied to .coral/ (hidden from agents)
     direction: str = "maximize"  # "maximize" or "minimize"
+    workers: int = 0  # parallel grading workers; 0 = default to agents.count (1 = serial)
 
 
 @dataclass
