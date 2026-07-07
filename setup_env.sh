@@ -16,8 +16,15 @@
 # Requires setup_opencode.sh next to this script (already in this repo).
 #
 # Usage (from anywhere):
-#   bash frameworks/CORAL/setup_env.sh             # full setup
-#   bash frameworks/CORAL/setup_env.sh --verify    # skip installs, just check
+#   bash frameworks/CORAL/setup_env.sh                      # base setup
+#   bash frameworks/CORAL/setup_env.sh --with-frontier-cs   # + Frontier-CS algorithmic track
+#   bash frameworks/CORAL/setup_env.sh --verify             # skip installs, just check
+#
+# --with-frontier-cs also provisions the Frontier-CS *algorithmic* track (the
+# workload behind set:offline / examples/frontier_cs_*): installs the frontier_cs
+# package into CORAL's uv venv and builds+starts the go-judge server on :8081, via
+# setup_frontier_cs_env.sh. Opt-in because it pulls a docker judge + runs a server;
+# the base env (for e.g. the self-contained `math` suite) needs none of it.
 #
 # Env overrides:
 #   CONDA_HOME   conda install prefix   ($CONDA_BASE override > `conda info --base` > ~/miniconda3)
@@ -38,7 +45,14 @@ CONDA_HOME="${CONDA_HOME:-${CONDA_BASE:-$(conda info --base 2>/dev/null)}}"; [ -
 CONDA_ENV="${CONDA_ENV:-coral}"
 CORAL_DIR="$(cd "$(dirname "$0")" && pwd)"     # this script lives in frameworks/CORAL
 VERIFY_ONLY=0
-[ "${1:-}" = "--verify" ] && VERIFY_ONLY=1
+WITH_FRONTIER_CS=0
+for a in "$@"; do
+    case "$a" in
+        --verify)           VERIFY_ONLY=1 ;;
+        --with-frontier-cs) WITH_FRONTIER_CS=1 ;;
+        *)                  printf '\033[31mERROR:\033[0m unknown arg: %s (use --verify and/or --with-frontier-cs)\n' "$a" >&2; exit 2 ;;
+    esac
+done
 
 say()  { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mok\033[0m %s\n' "$*"; }
@@ -64,6 +78,13 @@ if [ "$VERIFY_ONLY" = "0" ]; then
 
     say "4. opencode + bun + provider package"
     bash "$CORAL_DIR/setup_opencode.sh"
+
+    if [ "$WITH_FRONTIER_CS" = "1" ]; then
+        say "5. Frontier-CS algorithmic track (frontier_cs pkg + go-judge on :8081)"
+        # steps 1-2 (opencode, tmux) are already done above; skip to avoid redoing them.
+        SKIP_OPENCODE=1 SKIP_TMUX=1 bash "$CORAL_DIR/setup_frontier_cs_env.sh"
+        ok "Frontier-CS ready (frontier_cs importable; judge on :8081)"
+    fi
 fi
 
 say "verify"
