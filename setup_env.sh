@@ -82,7 +82,8 @@ if [ "$VERIFY_ONLY" = "0" ]; then
     if [ "$WITH_FRONTIER_CS" = "1" ]; then
         say "5. Frontier-CS algorithmic track (frontier_cs pkg + go-judge on :8081)"
         # steps 1-2 (opencode, tmux) are already done above; skip to avoid redoing them.
-        SKIP_OPENCODE=1 SKIP_TMUX=1 bash "$CORAL_DIR/setup_frontier_cs_env.sh"
+        SKIP_OPENCODE=1 SKIP_TMUX=1 CORAL_CONDA_BIN="$CONDA_HOME/envs/$CONDA_ENV/bin" \
+            bash "$CORAL_DIR/setup_frontier_cs_env.sh"
         ok "Frontier-CS ready (frontier_cs importable; judge on :8081)"
     fi
 fi
