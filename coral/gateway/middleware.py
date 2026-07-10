@@ -184,7 +184,11 @@ class CoralGatewayMiddleware:
         # Pass through to LiteLLM
         await self.app(scope, receive_wrapper, send_wrapper)
 
-        duration_ms = int((time.monotonic() - start_time) * 1000)
+        # Wall time bracketing the whole proxy handling of this call == the
+        # agent's text-to-text latency (request in -> full response out, incl.
+        # the upstream vLLM/Anthropic round trip and SSE reassembly).
+        t2t_latency_s = time.monotonic() - start_time
+        duration_ms = int(t2t_latency_s * 1000)
 
         # Log request (with messages trimmed for readability)
         request_body = b"".join(body_parts)
@@ -205,6 +209,7 @@ class CoralGatewayMiddleware:
             "response": _assemble_response(b"".join(response_body_parts)),
             "status_code": response_status,
             "duration_ms": duration_ms,
+            "t2t_latency_s": round(t2t_latency_s, 6),
         })
 
         return None

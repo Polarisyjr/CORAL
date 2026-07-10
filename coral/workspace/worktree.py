@@ -312,19 +312,26 @@ def setup_opencode_settings(
     if provider_options:
         # Custom provider name "vllm" + @ai-sdk/openai-compatible package
         # routes opencode through chat/completions instead of the Responses API.
+        models = {
+            "Qwen3-8B": {"name": "Qwen3-8B"},
+            "Qwen3-Coder-30B": {"name": "Qwen3-Coder-30B"},
+        }
+        # 1:1 gateway mode (CORAL_GATEWAY_T2T): agents request per-endpoint model
+        # names like "Qwen3-Coder-30B-0". opencode rejects any model not declared
+        # in this map ("Model not found: vllm/<model>"), so register the templated
+        # names too. Range is generous; unused declarations are harmless.
+        tmpl = os.environ.get("CORAL_AGENT_MODEL_TEMPLATE", "")
+        if tmpl.startswith("vllm/"):
+            model_tmpl = tmpl[len("vllm/"):]  # e.g. "Qwen3-Coder-30B-{idx}"
+            for i in range(32):
+                nm = model_tmpl.format(idx=i)
+                models[nm] = {"name": nm}
         settings["provider"] = {
             "vllm": {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "vllm",
                 "options": provider_options,
-                "models": {
-                    "Qwen3-8B": {
-                        "name": "Qwen3-8B"
-                    },
-                    "Qwen3-Coder-30B": {
-                        "name": "Qwen3-Coder-30B"
-                    },
-                }
+                "models": models,
             },
         }
 

@@ -211,6 +211,23 @@ class AgentManager:
                     pass
             logger.info("Grader daemon stopped")
 
+    def _agent_model(self, agent_id: str) -> str:
+        """Per-agent model name, for 1:1 pinning under the gateway.
+
+        Default: all agents share config.agents.model (unchanged behavior).
+        When CORAL_AGENT_MODEL_TEMPLATE is set (e.g. "vllm/Qwen3-Coder-30B-{idx}"),
+        each agent gets a distinct model derived from its 0-based index. Paired
+        with a gateway config that has one deployment per model name, this pins
+        agent-N to endpoint-N (restores direct-pool 1:1) while still routing
+        through the gateway so per-call text-to-text latency is recorded.
+        """
+        tmpl = os.environ.get("CORAL_AGENT_MODEL_TEMPLATE")
+        if not tmpl:
+            return self.config.agents.model
+        tail = agent_id.rsplit("-", 1)[-1]  # "agent-3" -> "3" (1-based)
+        idx = (int(tail) - 1) if tail.isdigit() else 0
+        return tmpl.format(idx=idx)
+
     def _start_gateway_if_enabled(self) -> None:
         """Start the LiteLLM gateway if configured."""
         assert self.paths is not None
@@ -372,7 +389,7 @@ class AgentManager:
         handle = self.runtime.start(
             worktree_path=worktree_path,
             coral_md_path=worktree_path / instruction_file,
-            model=self.config.agents.model,
+            model=self._agent_model(agent_id),
             runtime_options=self.config.agents.runtime_options,
             max_turns=max_turns if max_turns is not None else self.config.agents.max_turns,
             verbose=self.verbose,

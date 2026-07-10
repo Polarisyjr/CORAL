@@ -77,6 +77,7 @@ _TMUX_FORWARD_ENV = (
     "CORAL_POOL_CFG",
     "CORAL_GATEWAY_URL",
     "CORAL_GATEWAY_API_KEY",
+    "CORAL_AGENT_MODEL_TEMPLATE",  # per-agent model for 1:1 gateway pinning (coral-vllm.sh CORAL_GATEWAY_T2T=1)
     "PATH",
 )
 
