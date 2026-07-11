@@ -69,6 +69,8 @@ class AgentManager:
         self._gateway_keys: dict[str, str] = {}  # agent_id -> proxy key
         self._grader_proc: multiprocessing.Process | None = None
         self._grader_stop_event: Any | None = None  # multiprocessing.Event
+        self._one_shot_terminal = False
+        self._one_shot_failure: str | None = None
 
     def start_all(self) -> list[AgentHandle]:
         """Create workspace structure and spawn all agents."""
@@ -120,6 +122,7 @@ class AgentManager:
 
         # 5. Write PID file
         self._write_pid_file()
+        self._write_replay_recording_manifest()
 
         # 6. Register atexit handler as safety net for unexpected exits
         atexit.register(self._atexit_cleanup)
@@ -586,7 +589,30 @@ class AgentManager:
         if self._gateway:
             self._gateway.stop()
             self._gateway = None
+        self._write_replay_recording_manifest()
         logger.info("All agents stopped.")
+
+    def _write_replay_recording_manifest(self) -> None:
+        if self.config.agents.restart_exited or self.paths is None:
+            return
+        value = {
+            "schema_version": "coral.manager-recording/v1",
+            "one_shot": True,
+            "one_shot_terminal": self._one_shot_terminal,
+            "one_shot_failure": self._one_shot_failure,
+            "restart_counts": dict(self._restart_counts),
+            "restart_count": sum(self._restart_counts.values()),
+            "agents": self.status(),
+            "run_dir": str(self.paths.run_dir),
+            "repo_dir": str(self.paths.repo_dir),
+            "workspace_setup": list(self.config.workspace.setup),
+            "task_name": self.config.task.name,
+            "task_description": self.config.task.description,
+        }
+        path = self.paths.coral_dir / "public" / "replay_recording.json"
+        temporary = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
+        temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, path)
 
     def status(self) -> list[dict[str, Any]]:
         """Get status of all agents."""
@@ -595,6 +621,7 @@ class AgentManager:
             statuses.append({
                 "agent_id": handle.agent_id,
                 "alive": handle.alive,
+                "returncode": handle.process.returncode if handle.process else None,
                 "pid": handle.process.pid if handle.process else None,
                 "worktree": str(handle.worktree_path),
                 "log": str(handle.log_path),
@@ -804,6 +831,8 @@ class AgentManager:
                     )
 
                     # Check heartbeat actions
+                    if not self.config.agents.restart_exited:
+                        continue
                     runner = self._get_heartbeat_runner(committing_agent_id)
                     actions = runner.check(
                         local_eval_count=agent_eval_count,
@@ -861,6 +890,8 @@ class AgentManager:
             # Check for dead agents (max-turns exit, crash, etc.)
             for i, handle in enumerate(self.handles):
                 if not handle.alive and self._running:
+                    if not self.config.agents.restart_exited:
+                        continue
                     exit_code = handle.process.returncode if handle.process else None
                     count = self._restart_counts.get(handle.agent_id, 0) + 1
 
@@ -881,6 +912,14 @@ class AgentManager:
                     self.handles[i] = self._restart_agent(i, prompt=prompt)
                     self._write_agent_pids()
 
+            if not self.config.agents.restart_exited and not any(
+                handle.alive for handle in self.handles
+            ):
+                self._one_shot_terminal = self._one_shot_failure is None
+                self._running = False
+                self._write_replay_recording_manifest()
+                break
+
             # Check for stalled agents (alive but no output for > timeout)
             timeout = self.config.agents.timeout
             if timeout > 0:
@@ -891,6 +930,13 @@ class AgentManager:
                         except OSError:
                             continue
                         if age > timeout:
+                            if not self.config.agents.restart_exited:
+                                self._one_shot_failure = f"stalled:{handle.agent_id}"
+                                logger.error(
+                                    f"Agent {handle.agent_id} stalled during one-shot recording"
+                                )
+                                handle.stop()
+                                continue
                             logger.warning(
                                 f"Agent {handle.agent_id} stalled "
                                 f"({int(age)}s since last output), restarting"

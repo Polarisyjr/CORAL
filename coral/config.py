@@ -85,6 +85,7 @@ class AgentConfig:
     )
     research: bool = True  # enable web search / literature review step in workflow
     stagger_seconds: int = 0  # delay between spawning each agent (rate-limit backpressure)
+    restart_exited: bool = True  # false defines the finite replay-recording scope
 
     def heartbeat_interval(self, name: str) -> int:
         """Get the interval for a heartbeat action by name."""

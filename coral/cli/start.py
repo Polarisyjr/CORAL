@@ -461,12 +461,15 @@ def cmd_start(args: argparse.Namespace) -> None:
 
         start_ui_background(manager.paths.coral_dir)
 
-    if config.agents.count == 1 and verbose:
-        print("\nAgent running...\n")
-        manager.wait_for_completion()
-    else:
-        print("\nMonitoring agents...")
-        manager.monitor_loop()
+    try:
+        if config.agents.count == 1 and verbose:
+            print("\nAgent running...\n")
+            manager.wait_for_completion()
+        else:
+            print("\nMonitoring agents...")
+            manager.monitor_loop()
+    finally:
+        manager.stop_all()
 
 
 def _resume_in_docker(args: argparse.Namespace, config: CoralConfig, coral_dir: Path) -> None:
