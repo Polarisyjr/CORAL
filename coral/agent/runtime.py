@@ -63,6 +63,7 @@ class AgentHandle:
     worktree_path: Path
     log_path: Path
     session_id: str | None = None
+    recording_data_path: Path | None = None
     _log_file: object | None = None  # keep reference to prevent GC closing the file
 
     @property

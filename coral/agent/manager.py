@@ -626,6 +626,11 @@ class AgentManager:
                 "worktree": str(handle.worktree_path),
                 "log": str(handle.log_path),
                 "session_id": handle.session_id,
+                "recording_data_path": (
+                    str(handle.recording_data_path)
+                    if handle.recording_data_path is not None
+                    else None
+                ),
                 "restarts": self._restart_counts.get(handle.agent_id, 0),
             })
         return statuses
