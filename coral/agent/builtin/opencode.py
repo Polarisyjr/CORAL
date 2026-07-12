@@ -137,7 +137,11 @@ class OpenCodeRuntime:
         # at session creation ("SQLiteError: database is locked" ->
         # LockTimeoutError) before their first turn, so they never call the
         # model. Isolating the data dir per worktree removes that contention.
-        opencode_data = worktree_path / ".opencode_data"
+        # Keep capture state outside the agent worktree. Agents routinely run
+        # `coral eval`, which commits or deletes unignored worktree files; a
+        # database inside the worktree can therefore disappear before the
+        # recording builder reads nested subagent tool calls.
+        opencode_data = log_dir.parent.parent / "private/opencode-data" / agent_id
         opencode_data.mkdir(parents=True, exist_ok=True)
         agent_env["XDG_DATA_HOME"] = str(opencode_data)
 
@@ -226,5 +230,6 @@ class OpenCodeRuntime:
             worktree_path=worktree_path,
             log_path=log_path,
             session_id=resume_session_id,
+            recording_data_path=opencode_data,
             _log_file=log_file_ref,
         )

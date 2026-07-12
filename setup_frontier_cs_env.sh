@@ -48,6 +48,12 @@ REPO_ROOT="$(cd "$CORAL_DIR/../.." && pwd)"
 FRONTIER_CS="${FRONTIER_CS:-$REPO_ROOT/data/Frontier-CS}"
 COMPOSE_VERSION="${COMPOSE_VERSION:-v2.32.4}"
 
+if [ -n "${DOCKER_CMD:-}" ]; then
+    docker() { read -r -a _docker_cmd <<< "$DOCKER_CMD"; "${_docker_cmd[@]}" "$@"; }
+elif ! command docker ps >/dev/null 2>&1 && sudo -n docker ps >/dev/null 2>&1; then
+    docker() { sudo -n docker "$@"; }
+fi
+
 log "CORAL dir:    $CORAL_DIR"
 log "Repo root:    $REPO_ROOT"
 log "Frontier-CS:  $FRONTIER_CS"
