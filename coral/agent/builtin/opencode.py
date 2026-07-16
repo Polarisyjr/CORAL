@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -14,6 +16,69 @@ from coral.agent.runtime import AgentHandle, write_coral_log_entry
 from coral.workspace.repo import _clean_env
 
 logger = logging.getLogger(__name__)
+
+
+def _is_completed_turn(line: str) -> bool:
+    """Whether one OpenCode JSON-stream record completes a model turn."""
+    try:
+        return json.loads(line).get("type") == "step_finish"
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+def _tee_and_limit(
+    proc: subprocess.Popen,
+    log_f,
+    agent: str,
+    log_path: Path,
+    max_turns: int,
+    verbose: bool,
+) -> None:
+    turns = 0
+    limit_sent = False
+    marker = log_path.with_suffix(".turn-limit.json")
+    try:
+        assert proc.stdout is not None
+        for line in iter(proc.stdout.readline, b""):
+            decoded = line.decode("utf-8", errors="replace")
+            if verbose:
+                sys.stdout.write(f"[{agent}] {decoded}")
+                sys.stdout.flush()
+            log_f.write(decoded)
+            log_f.flush()
+            if _is_completed_turn(decoded):
+                turns += 1
+            if max_turns > 0 and turns >= max_turns and not limit_sent:
+                limit_sent = True
+                marker.write_text(
+                    json.dumps(
+                        {
+                            "agent_id": agent,
+                            "max_turns": max_turns,
+                            "turns_completed": turns,
+                            "terminal_reason": "max_turns",
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                logger.info(f"OpenCode agent {agent} reached max_turns={max_turns}")
+                try:
+                    # OpenCode installs handlers for SIGINT/SIGTERM and can begin
+                    # another model step after either signal.  The limit is a hard
+                    # request budget, so terminate the isolated agent process group.
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+    except Exception as e:
+        logger.error(f"OpenCode stream thread error: {e}")
+    finally:
+        log_f.close()
+        if proc.stdout:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
 
 def _extract_opencode_session_id(log_path: Path) -> str | None:
@@ -175,52 +240,21 @@ class OpenCodeRuntime:
             task_description=task_description,
         )
 
-        if verbose:
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(worktree_path),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                env=agent_env,
-            )
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(worktree_path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=agent_env,
+        )
 
-            def _tee_output(proc: subprocess.Popen, log_f, agent: str) -> None:
-                try:
-                    assert proc.stdout is not None
-                    for line in iter(proc.stdout.readline, b""):
-                        decoded = line.decode("utf-8", errors="replace")
-                        sys.stdout.write(f"[{agent}] {decoded}")
-                        sys.stdout.flush()
-                        log_f.write(decoded)
-                        log_f.flush()
-                except Exception as e:
-                    logger.error(f"Tee thread error: {e}")
-                finally:
-                    log_f.close()
-                    if proc.stdout:
-                        try:
-                            proc.stdout.close()
-                        except Exception:
-                            pass
-
-            tee_thread = threading.Thread(
-                target=_tee_output,
-                args=(process, log_file, agent_id),
-                daemon=True,
-            )
-            tee_thread.start()
-            log_file_ref = None
-        else:
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(worktree_path),
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                env=agent_env,
-            )
-            log_file_ref = log_file
+        threading.Thread(
+            target=_tee_and_limit,
+            args=(process, log_file, agent_id, log_path, max_turns, verbose),
+            daemon=True,
+        ).start()
+        log_file_ref = None
 
         logger.info(f"OpenCode agent {agent_id} started with PID {process.pid}")
 
