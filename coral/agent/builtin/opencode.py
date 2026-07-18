@@ -216,6 +216,7 @@ class OpenCodeRuntime:
         logger.info(f"Command: {' '.join(cmd)}")
 
         agent_env = _clean_env()
+        agent_env["CORAL_AGENT_ID"] = agent_id
         worktree_venv = str(worktree_path / ".venv")
         agent_env["UV_PROJECT_ENVIRONMENT"] = worktree_venv
         # Set VIRTUAL_ENV so login shells (which reset PATH) can restore it

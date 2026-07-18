@@ -35,6 +35,7 @@ from coral.hub.attempts import (
     read_attempts,
     write_attempt,
 )
+from coral.recording import runtime_span
 from coral.types import Attempt, Task
 
 logger = logging.getLogger(__name__)
@@ -283,46 +284,68 @@ def _grade_one(
     feedback = ""
     metadata: dict = {}
 
-    try:
-        _add_isolated_worktree(repo_dir, attempt.commit_hash, checkout_path)
+    with runtime_span(
+        "coral.eval.grade",
+        actor_id=attempt.agent_id,
+        eval_id=attempt.commit_hash,
+        attributes={"timeout_s": timeout, "checkout_path": str(checkout_path)},
+    ) as grade_span:
         try:
-            bundle = _run_grader_with_timeout(
-                str(config_path), str(coral_dir), str(checkout_path), [task], timeout,
-            )
-            score = bundle.aggregated
-            feedback = _build_feedback(bundle)
-            metadata = dict(getattr(bundle, "metadata", None) or {})
-            status = _compute_status(
-                score, attempt.agent_id, attempt.commit_hash, coral_dir, minimize,
-            )
-        finally:
-            _remove_worktree(repo_dir, checkout_path)
-    except TimeoutError:
-        logger.error("Grader timed out on %s after %ss", attempt.commit_hash[:12], timeout)
-        status = "timeout"
-        feedback = f"Eval timed out after {timeout}s."
-    except Exception as e:
-        logger.exception("Grader crashed on %s", attempt.commit_hash[:12])
-        status = "crashed"
-        feedback = str(e)
+            _add_isolated_worktree(repo_dir, attempt.commit_hash, checkout_path)
+            try:
+                bundle = _run_grader_with_timeout(
+                    str(config_path), str(coral_dir), str(checkout_path), [task], timeout,
+                )
+                score = bundle.aggregated
+                feedback = _build_feedback(bundle)
+                metadata = dict(getattr(bundle, "metadata", None) or {})
+                status = _compute_status(
+                    score, attempt.agent_id, attempt.commit_hash, coral_dir, minimize,
+                )
+            finally:
+                _remove_worktree(repo_dir, checkout_path)
+        except TimeoutError:
+            logger.error("Grader timed out on %s after %ss", attempt.commit_hash[:12], timeout)
+            status = "timeout"
+            feedback = f"Eval timed out after {timeout}s."
+        except Exception as e:
+            logger.exception("Grader crashed on %s", attempt.commit_hash[:12])
+            status = "crashed"
+            feedback = str(e)
+        grade_span.set_result(
+            score=score,
+            attempt_status=status,
+            feedback=feedback,
+            metadata=metadata,
+        )
 
-    finalized = Attempt(
-        commit_hash=attempt.commit_hash,
-        agent_id=attempt.agent_id,
-        title=attempt.title,
-        score=score,
-        status=status,
-        parent_hash=attempt.parent_hash,
-        # Preserve original submission timestamp; daemon doesn't re-stamp.
-        timestamp=attempt.timestamp,
-        feedback=feedback,
-        shared_state_hash=attempt.shared_state_hash,
-        parent_shared_state_hash=attempt.parent_shared_state_hash,
-        metadata=metadata,
-    )
-    write_attempt(str(coral_dir), finalized)
-    with _COUNT_LOCK:
-        count = increment_eval_count(coral_dir)
+    with runtime_span(
+        "coral.eval.finalize",
+        actor_id=attempt.agent_id,
+        eval_id=attempt.commit_hash,
+    ) as finalize_span:
+        finalized = Attempt(
+            commit_hash=attempt.commit_hash,
+            agent_id=attempt.agent_id,
+            title=attempt.title,
+            score=score,
+            status=status,
+            parent_hash=attempt.parent_hash,
+            # Preserve original submission timestamp; daemon doesn't re-stamp.
+            timestamp=attempt.timestamp,
+            feedback=feedback,
+            shared_state_hash=attempt.shared_state_hash,
+            parent_shared_state_hash=attempt.parent_shared_state_hash,
+            metadata=metadata,
+        )
+        write_attempt(str(coral_dir), finalized)
+        with _COUNT_LOCK:
+            count = increment_eval_count(coral_dir)
+        finalize_span.set_result(
+            score=score,
+            attempt_status=status,
+            eval_count=count,
+        )
     logger.info(
         "Graded #%d %s -> score=%s status=%s",
         count, attempt.commit_hash[:12],

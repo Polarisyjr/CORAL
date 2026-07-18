@@ -10,8 +10,8 @@ import subprocess
 from pathlib import Path
 
 from coral.workspace.repo import (
-    run_setup_commands,
     _clean_env,
+    run_setup_commands,
 )
 
 logger = logging.getLogger(__name__)
@@ -289,6 +289,15 @@ def setup_opencode_settings(
         },
     }
 
+    if os.environ.get("CORAL_TRACE_PATH"):
+        recorder = (
+            Path(__file__).resolve().parents[1]
+            / "agent"
+            / "builtin"
+            / "opencode_recorder.js"
+        )
+        settings["plugin"] = [recorder.resolve().as_uri()]
+
     # Resolve the agent's baseURL. Priority:
     #   1. CORAL_VLLM_POOL env var (per-agent direct vLLM binding, gateway bypassed)
     #   2. gateway_url passed in (CORAL-spawned LiteLLM gateway)
@@ -428,4 +437,3 @@ def setup_worktree_env(worktree_path: Path, setup_commands: list[str]) -> None:
                 logger.warning(
                     f"Failed to install coral in worktree: {result.stderr.strip()}"
                 )
-

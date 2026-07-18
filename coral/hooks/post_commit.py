@@ -22,6 +22,7 @@ from coral.hub.attempts import (
     write_attempt,
 )
 from coral.hub.checkpoint import checkpoint
+from coral.recording import runtime_span
 from coral.types import Attempt
 
 # Legacy alias — external tests/hooks may still import the underscore-prefixed
@@ -131,48 +132,60 @@ def submit_eval(
     """
     workdir_path = Path(workdir).resolve()
 
-    coral_dir = _find_coral_dir(workdir_path)
-    if coral_dir is None:
-        raise FileNotFoundError(f"No .coral directory found from {workdir_path}")
+    with runtime_span(
+        "coral.eval.submit",
+        actor_id=agent_id,
+        attributes={"message": message, "workdir": str(workdir_path)},
+    ) as submit_span:
+        coral_dir = _find_coral_dir(workdir_path)
+        if coral_dir is None:
+            raise FileNotFoundError(f"No .coral directory found from {workdir_path}")
 
-    config_path = coral_dir / "config.yaml"
-    if not config_path.exists():
-        raise FileNotFoundError(f"No config.yaml found at {config_path}")
-    config = CoralConfig.from_yaml(config_path)
+        config_path = coral_dir / "config.yaml"
+        if not config_path.exists():
+            raise FileNotFoundError(f"No config.yaml found at {config_path}")
+        config = CoralConfig.from_yaml(config_path)
 
-    # Git add + commit
-    commit_hash = _git_add_and_commit(message, str(workdir_path))
-    parent_hash = _get_parent_hash(commit_hash, str(workdir_path))
+        # Git add + commit
+        commit_hash = _git_add_and_commit(message, str(workdir_path))
+        submit_span.set_eval_id(commit_hash)
+        parent_hash = _get_parent_hash(commit_hash, str(workdir_path))
 
-    # Checkpoint shared state at submission time (captures agent's current notes/skills).
-    shared_state_hash = checkpoint(str(coral_dir), agent_id, message)
+        # Checkpoint shared state at submission time (captures agent's current notes/skills).
+        shared_state_hash = checkpoint(str(coral_dir), agent_id, message)
 
-    # Look up parent attempt's shared state hash for provenance chain.
-    parent_shared_state_hash = None
-    if parent_hash:
-        parent_attempt_file = coral_dir / "public" / "attempts" / f"{parent_hash}.json"
-        if parent_attempt_file.exists():
-            try:
-                parent_data = json.loads(parent_attempt_file.read_text())
-                parent_shared_state_hash = parent_data.get("shared_state_hash")
-            except (json.JSONDecodeError, OSError):
-                pass
+        # Look up parent attempt's shared state hash for provenance chain.
+        parent_shared_state_hash = None
+        if parent_hash:
+            parent_attempt_file = coral_dir / "public" / "attempts" / f"{parent_hash}.json"
+            if parent_attempt_file.exists():
+                try:
+                    parent_data = json.loads(parent_attempt_file.read_text())
+                    parent_shared_state_hash = parent_data.get("shared_state_hash")
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-    # Write pending record. The grader daemon will observe this and fill in
-    # score/status/feedback asynchronously.
-    attempt = Attempt(
-        commit_hash=commit_hash,
-        agent_id=agent_id,
-        title=message,
-        score=None,
-        status="pending",
-        parent_hash=parent_hash,
-        timestamp=datetime.now(UTC).isoformat(),
-        feedback="",
-        shared_state_hash=shared_state_hash,
-        parent_shared_state_hash=parent_shared_state_hash,
-    )
-    write_attempt(str(coral_dir), attempt)
+        # Write pending record. The grader daemon will observe this and fill in
+        # score/status/feedback asynchronously.
+        attempt = Attempt(
+            commit_hash=commit_hash,
+            agent_id=agent_id,
+            title=message,
+            score=None,
+            status="pending",
+            parent_hash=parent_hash,
+            timestamp=datetime.now(UTC).isoformat(),
+            feedback="",
+            shared_state_hash=shared_state_hash,
+            parent_shared_state_hash=parent_shared_state_hash,
+        )
+        write_attempt(str(coral_dir), attempt)
+        submit_span.set_result(
+            commit_hash=commit_hash,
+            parent_hash=parent_hash,
+            shared_state_hash=shared_state_hash,
+            attempt_status="pending",
+        )
 
     if not wait:
         return attempt
@@ -184,7 +197,18 @@ def submit_eval(
         # 2x the grader budget + 60s slack, with a floor of 300s for fast graders.
         poll_timeout = max(grader_timeout * 2 + 60, 300) if grader_timeout else 3600
 
-    final = _poll_until_graded(coral_dir, commit_hash, poll_timeout)
+    with runtime_span(
+        "coral.eval.await_result",
+        actor_id=agent_id,
+        eval_id=commit_hash,
+        attributes={"timeout_s": poll_timeout},
+    ) as await_span:
+        final = _poll_until_graded(coral_dir, commit_hash, poll_timeout)
+        await_span.set_result(
+            score=final.score,
+            attempt_status=final.status,
+            feedback=final.feedback,
+        )
 
     # Attach eval_count for display by cmd_eval (best-effort; daemon bumps this).
     try:
