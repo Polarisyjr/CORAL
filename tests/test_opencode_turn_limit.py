@@ -1,8 +1,14 @@
 import json
+import os
+import signal
 import subprocess
 import sys
 
-from coral.agent.builtin.opencode import _is_completed_turn, _tee_and_limit
+from coral.agent.builtin.opencode import (
+    _install_signal_safe_shell,
+    _is_completed_turn,
+    _tee_and_limit,
+)
 
 
 def test_completed_turn_only_accepts_step_finish_json() -> None:
@@ -36,3 +42,22 @@ def test_stream_stops_process_group_at_turn_limit(tmp_path) -> None:
         "terminal_reason": "max_turns",
         "turns_completed": 2,
     }
+
+
+def test_signal_safe_shell_reports_signal_as_numeric_exit(tmp_path) -> None:
+    env = {"PATH": os.environ["PATH"], "SHELL": "/bin/bash"}
+    wrapper = _install_signal_safe_shell(env, tmp_path)
+
+    aborted = subprocess.run(
+        [str(wrapper), "-c", "kill -ABRT $$"],
+        capture_output=True,
+        env=env,
+    )
+    ordinary_failure = subprocess.run(
+        [str(wrapper), "-c", "exit 23"],
+        capture_output=True,
+        env=env,
+    )
+
+    assert aborted.returncode == 128 + signal.SIGABRT
+    assert ordinary_failure.returncode == 23

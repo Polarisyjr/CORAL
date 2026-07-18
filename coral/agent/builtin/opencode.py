@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -16,6 +17,36 @@ from coral.agent.runtime import AgentHandle, write_coral_log_entry
 from coral.workspace.repo import _clean_env
 
 logger = logging.getLogger(__name__)
+
+
+_SHELL_WRAPPER = """#!/bin/sh
+"$CORAL_REAL_SHELL" "$@"
+status=$?
+exit "$status"
+"""
+
+
+def _install_signal_safe_shell(env: dict[str, str], data_dir: Path) -> Path:
+    """Keep signal-terminated shell commands from waiting for OpenCode's timeout.
+
+    Effect's Node child-process adapter fails ``handle.exitCode`` when a process
+    exits due to a signal. OpenCode races that failed effect against its timeout,
+    so an immediately-aborted command is incorrectly reported as a timeout. An
+    outer shell turns the inner shell's signal termination into the conventional
+    numeric status (for example, SIGABRT becomes 134).
+    """
+    requested_shell = env.get("SHELL")
+    real_shell = (
+        shutil.which(requested_shell, path=env.get("PATH")) if requested_shell else None
+    ) or shutil.which("bash", path=env.get("PATH")) or "/bin/sh"
+    wrapper_dir = data_dir / "coral-shell"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper = wrapper_dir / Path(real_shell).name
+    wrapper.write_text(_SHELL_WRAPPER)
+    wrapper.chmod(0o700)
+    env["CORAL_REAL_SHELL"] = real_shell
+    env["SHELL"] = str(wrapper)
+    return wrapper
 
 
 def _is_completed_turn(line: str) -> bool:
@@ -209,6 +240,7 @@ class OpenCodeRuntime:
         opencode_data = log_dir.parent.parent / "private/opencode-data" / agent_id
         opencode_data.mkdir(parents=True, exist_ok=True)
         agent_env["XDG_DATA_HOME"] = str(opencode_data)
+        _install_signal_safe_shell(agent_env, opencode_data)
 
         # Disable OpenCode's filesystem watcher. Each agent's watcher opens an
         # inotify instance, and the kernel caps these at
