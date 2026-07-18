@@ -72,6 +72,17 @@ class AgentManager:
         self._one_shot_terminal = False
         self._one_shot_failure: str | None = None
 
+    def _turn_count(self) -> int:
+        """Return agent invocations started across the whole team."""
+        return self.config.agents.count + sum(self._restart_counts.values())
+
+    def _turn_budget_exhausted(self) -> bool:
+        limit = self.config.agents.max_total_turns
+        return limit > 0 and self._turn_count() >= limit
+
+    def _recording_manifest_enabled(self) -> bool:
+        return not self.config.agents.restart_exited or self.config.agents.max_total_turns > 0
+
     def start_all(self) -> list[AgentHandle]:
         """Create workspace structure and spawn all agents."""
         self._start_time = datetime.now(UTC)
@@ -610,13 +621,15 @@ class AgentManager:
         logger.info("All agents stopped.")
 
     def _write_replay_recording_manifest(self) -> None:
-        if self.config.agents.restart_exited or self.paths is None:
+        if not self._recording_manifest_enabled() or self.paths is None:
             return
         value = {
             "schema_version": "coral.manager-recording/v1",
-            "one_shot": True,
+            "one_shot": not self.config.agents.restart_exited,
             "one_shot_terminal": self._one_shot_terminal,
             "one_shot_failure": self._one_shot_failure,
+            "max_total_turns": self.config.agents.max_total_turns,
+            "turn_count": self._turn_count(),
             "restart_counts": dict(self._restart_counts),
             "restart_count": sum(self._restart_counts.values()),
             "agents": self.status(),
@@ -896,6 +909,11 @@ class AgentManager:
 
                     combined_prompt = "\n\n".join(prompts)
                     names = ", ".join(action_names)
+                    if self._turn_budget_exhausted():
+                        logger.info(
+                            f"Heartbeat [{names}] skipped: shared turn budget exhausted"
+                        )
+                        continue
                     logger.info(
                         f"Heartbeat [{names}] (agent eval #{agent_eval_count}): "
                         f"interrupting {committing_agent_id}"
@@ -913,6 +931,8 @@ class AgentManager:
             for i, handle in enumerate(self.handles):
                 if not handle.alive and self._running:
                     if not self.config.agents.restart_exited:
+                        continue
+                    if self._turn_budget_exhausted():
                         continue
                     exit_code = handle.process.returncode if handle.process else None
                     count = self._restart_counts.get(handle.agent_id, 0) + 1
@@ -934,9 +954,10 @@ class AgentManager:
                     self.handles[i] = self._restart_agent(i, prompt=prompt)
                     self._write_agent_pids()
 
-            if not self.config.agents.restart_exited and not any(
-                handle.alive for handle in self.handles
-            ):
+            finite_team_terminal = (
+                not self.config.agents.restart_exited or self._turn_budget_exhausted()
+            ) and not any(handle.alive for handle in self.handles)
+            if finite_team_terminal:
                 self._one_shot_terminal = self._one_shot_failure is None
                 self._running = False
                 self._write_replay_recording_manifest()

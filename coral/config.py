@@ -74,6 +74,7 @@ class AgentConfig:
     warmstart: WarmStartConfig = field(default_factory=WarmStartConfig)
     runtime_options: dict[str, Any] = field(default_factory=dict)
     max_turns: int = 200
+    max_total_turns: int = 0  # shared agent invocation budget; 0 disables it
     timeout: int = 3600
     heartbeat: list[HeartbeatActionConfig] = field(
         default_factory=lambda: [
