@@ -71,6 +71,8 @@ class AgentManager:
         self._grader_stop_event: Any | None = None  # multiprocessing.Event
         self._one_shot_terminal = False
         self._one_shot_failure: str | None = None
+        self._termination_reason: str | None = None
+        self._replay_cutoff_at_ns: int | None = None
 
     def _turn_count(self) -> int:
         """Return agent invocations started across the whole team."""
@@ -455,7 +457,9 @@ class AgentManager:
         agent_id = handle.agent_id
 
         # SIGINT the agent — Claude Code saves session gracefully
-        session_id = handle.interrupt()
+        session_id = handle.interrupt(
+            at_turn_boundary=self.config.agents.max_total_turns > 0,
+        )
         self._restart_counts[agent_id] = self._restart_counts.get(agent_id, 0) + 1
 
         if session_id:
@@ -589,11 +593,13 @@ class AgentManager:
             return self.runtime.extract_session_id(logs[-1])
         return None
 
-    def stop_all(self) -> None:
+    def stop_all(self, *, immediate: bool = False) -> None:
         """Gracefully stop all agents.
 
         Uses SIGINT first so Claude Code can save sessions for later resume,
-        then falls back to SIGTERM/SIGKILL if needed.
+        then falls back to SIGTERM/SIGKILL if needed. A finite recording that
+        reaches its shared invocation budget instead signals every process group
+        before waiting, matching the wall-clock stop semantics used by Step3.
         """
         if self._stopping:
             return
@@ -602,9 +608,15 @@ class AgentManager:
         self._stop_event.set()
         # Save session IDs before killing processes
         self._save_sessions()
-        for handle in self.handles:
-            # Try graceful interrupt first so sessions can be resumed
-            handle.interrupt()
+        if immediate:
+            # Signal the whole team first so one slow process cannot extend the
+            # other lanes while stop_all waits/reaps sequentially below.
+            for handle in self.handles:
+                handle.signal_process_group(signal.SIGTERM)
+        else:
+            for handle in self.handles:
+                # Try graceful interrupt first so sessions can be resumed
+                handle.interrupt()
         # Force-stop any that didn't exit
         for handle in self.handles:
             if handle.alive:
@@ -628,6 +640,8 @@ class AgentManager:
             "one_shot": not self.config.agents.restart_exited,
             "one_shot_terminal": self._one_shot_terminal,
             "one_shot_failure": self._one_shot_failure,
+            "termination_reason": self._termination_reason,
+            "replay_cutoff_at_ns": self._replay_cutoff_at_ns,
             "max_total_turns": self.config.agents.max_total_turns,
             "turn_count": self._turn_count(),
             "restart_counts": dict(self._restart_counts),
@@ -954,6 +968,20 @@ class AgentManager:
                     self.handles[i] = self._restart_agent(i, prompt=prompt)
                     self._write_agent_pids()
 
+            if self._turn_budget_exhausted() and any(
+                handle.alive for handle in self.handles
+            ):
+                self._one_shot_terminal = self._one_shot_failure is None
+                self._termination_reason = "max_total_turns"
+                # Everything ending after this instant is a deliberately
+                # truncated tail and is outside the replay scope.
+                self._replay_cutoff_at_ns = time.time_ns()
+                logger.info(
+                    "Shared turn budget reached; stopping the whole team immediately"
+                )
+                self.stop_all(immediate=True)
+                break
+
             finite_team_terminal = (
                 not self.config.agents.restart_exited or self._turn_budget_exhausted()
             ) and not any(handle.alive for handle in self.handles)
@@ -973,6 +1001,12 @@ class AgentManager:
                         except OSError:
                             continue
                         if age > timeout:
+                            if self._turn_budget_exhausted():
+                                logger.info(
+                                    f"Stalled-agent restart skipped for {handle.agent_id}: "
+                                    "shared turn budget exhausted"
+                                )
+                                continue
                             if not self.config.agents.restart_exited:
                                 self._one_shot_failure = f"stalled:{handle.agent_id}"
                                 logger.error(

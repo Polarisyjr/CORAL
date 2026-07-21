@@ -64,6 +64,7 @@ def _tee_and_limit(
     log_path: Path,
     max_turns: int,
     verbose: bool,
+    turn_boundary_stop: threading.Event | None = None,
 ) -> None:
     turns = 0
     limit_sent = False
@@ -79,6 +80,15 @@ def _tee_and_limit(
             log_f.flush()
             if _is_completed_turn(decoded):
                 turns += 1
+                if turn_boundary_stop is not None and turn_boundary_stop.is_set():
+                    # OpenCode may start another model request after SIGINT/SIGTERM.
+                    # At step_finish every tool hook has already emitted its end
+                    # record, so a hard stop here preserves recorder completeness.
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        proc.kill()
+                    continue
             if max_turns > 0 and turns >= max_turns and not limit_sent:
                 limit_sent = True
                 marker.write_text(
@@ -282,9 +292,18 @@ class OpenCodeRuntime:
             env=agent_env,
         )
 
+        turn_boundary_stop = threading.Event()
         threading.Thread(
             target=_tee_and_limit,
-            args=(process, log_file, agent_id, log_path, max_turns, verbose),
+            args=(
+                process,
+                log_file,
+                agent_id,
+                log_path,
+                max_turns,
+                verbose,
+                turn_boundary_stop,
+            ),
             daemon=True,
         ).start()
         log_file_ref = None
@@ -299,4 +318,5 @@ class OpenCodeRuntime:
             session_id=resume_session_id,
             recording_data_path=opencode_data,
             _log_file=log_file_ref,
+            _request_turn_boundary_stop=turn_boundary_stop.set,
         )

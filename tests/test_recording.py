@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from coral.agent.manager import AgentManager
 from coral.grader import daemon
 from coral.hooks.post_commit import submit_eval
 from coral.recording import runtime_span
@@ -19,11 +21,53 @@ from coral.workspace.worktree import setup_opencode_settings
 from tests.test_hooks import _setup_repo_with_config
 
 
+class _ImmediateStopHandle:
+    def __init__(self, name: str, events: list[str]) -> None:
+        self.name = name
+        self.events = events
+        self.alive = True
+
+    def signal_process_group(self, sig: int) -> None:
+        assert sig == signal.SIGTERM
+        self.events.append(f"signal:{self.name}")
+
+    def stop(self) -> None:
+        assert self.events[:2] == ["signal:agent-1", "signal:agent-2"]
+        self.events.append(f"stop:{self.name}")
+        self.alive = False
+
+
 def _end_records(path: Path) -> list[dict]:
     return [
         record
         for record in map(json.loads, path.read_text().splitlines())
         if record.get("phase") == "end"
+    ]
+
+
+def test_immediate_stop_signals_whole_team_before_waiting() -> None:
+    events: list[str] = []
+    manager = object.__new__(AgentManager)
+    manager._stopping = False
+    manager._running = True
+    manager._stop_event = threading.Event()
+    manager.handles = [
+        _ImmediateStopHandle("agent-1", events),
+        _ImmediateStopHandle("agent-2", events),
+    ]
+    manager._gateway = None
+    manager._save_sessions = lambda: None
+    manager._cleanup_pid_file = lambda: None
+    manager._stop_grader_daemon = lambda: None
+    manager._write_replay_recording_manifest = lambda: None
+
+    manager.stop_all(immediate=True)
+
+    assert events == [
+        "signal:agent-1",
+        "signal:agent-2",
+        "stop:agent-1",
+        "stop:agent-2",
     ]
 
 

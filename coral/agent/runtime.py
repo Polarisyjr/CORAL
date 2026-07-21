@@ -7,8 +7,9 @@ import logging
 import os
 import signal
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Protocol, runtime_checkable
 
@@ -65,6 +66,7 @@ class AgentHandle:
     session_id: str | None = None
     recording_data_path: Path | None = None
     _log_file: object | None = None  # keep reference to prevent GC closing the file
+    _request_turn_boundary_stop: Callable[[], None] | None = None
 
     @property
     def alive(self) -> bool:
@@ -108,30 +110,56 @@ class AgentHandle:
             except Exception:
                 pass
 
-    def interrupt(self) -> str | None:
+    def signal_process_group(self, sig: int) -> None:
+        """Signal the agent's whole process group without waiting for exit."""
+        if not self.process or not self.alive:
+            return
+        try:
+            os.killpg(os.getpgid(self.process.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            self.process.send_signal(sig)
+
+    def interrupt(self, *, at_turn_boundary: bool = False) -> str | None:
         """Interrupt a running agent via SIGINT (like Ctrl+C).
 
         Claude Code handles SIGINT gracefully — it saves the session so it can
-        be resumed later. Returns the session_id extracted from the log, or None.
+        be resumed later. OpenCode recording runs can instead request a hard stop
+        immediately after the next completed model/tool turn, avoiding a partial
+        tool event. Returns the session_id extracted from the log, or None.
         """
         if not self.process or not self.alive:
             return _extract_session_id(self.log_path)
 
         pid = self.process.pid
-        logger.info(f"Interrupting agent {self.agent_id} (PID {pid}) with SIGINT")
+        boundary_stop = at_turn_boundary and self._request_turn_boundary_stop is not None
+        if boundary_stop:
+            logger.info(
+                f"Stopping agent {self.agent_id} (PID {pid}) at next turn boundary"
+            )
+            self._request_turn_boundary_stop()
+        else:
+            logger.info(f"Interrupting agent {self.agent_id} (PID {pid}) with SIGINT")
 
-        # Send SIGINT to process group (same as Ctrl+C)
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGINT)
-        except (ProcessLookupError, PermissionError):
-            self.process.send_signal(signal.SIGINT)
+            # Send SIGINT to process group (same as Ctrl+C)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGINT)
+            except (ProcessLookupError, PermissionError):
+                self.process.send_signal(signal.SIGINT)
 
         # Wait for graceful exit
         try:
-            self.process.wait(timeout=15)
-            logger.info(f"Agent {self.agent_id} exited after SIGINT (rc={self.process.returncode})")
+            # A boundary stop may need to wait for a long-running grader/tool.
+            self.process.wait(timeout=900 if boundary_stop else 15)
+            reason = "turn-boundary stop" if boundary_stop else "SIGINT"
+            logger.info(
+                f"Agent {self.agent_id} exited after {reason} "
+                f"(rc={self.process.returncode})"
+            )
         except subprocess.TimeoutExpired:
-            logger.warning(f"Agent {self.agent_id} didn't stop after SIGINT, sending SIGTERM...")
+            logger.warning(
+                f"Agent {self.agent_id} didn't reach a safe stop boundary, "
+                "sending SIGTERM..."
+            )
             self.process.terminate()
             try:
                 self.process.wait(timeout=5)
@@ -184,7 +212,7 @@ def write_coral_log_entry(
         "source": source,
         "agent_id": agent_id,
         "prompt": prompt,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
     if session_id:
         entry["session_id"] = session_id
@@ -222,7 +250,7 @@ def _extract_session_id(log_path: Path) -> str | None:
                 continue
             try:
                 data = json.loads(line)
-                sid = data.get("session_id")
+                sid = data.get("session_id") or data.get("sessionId") or data.get("sessionID")
                 if sid:
                     return sid
             except json.JSONDecodeError:
