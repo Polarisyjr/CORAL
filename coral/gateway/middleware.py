@@ -167,6 +167,7 @@ class CoralGatewayMiddleware:
         scope["headers"] = new_headers
 
         # Track response
+        ts_start_ns = time.time_ns()
         start_time = time.monotonic()
         response_status = 0
         response_body_parts: list[bytes] = []
@@ -188,6 +189,7 @@ class CoralGatewayMiddleware:
         # agent's text-to-text latency (request in -> full response out, incl.
         # the upstream vLLM/Anthropic round trip and SSE reassembly).
         t2t_latency_s = time.monotonic() - start_time
+        ts_end_ns = time.time_ns()
         duration_ms = int(t2t_latency_s * 1000)
 
         # Log request (with messages trimmed for readability)
@@ -200,6 +202,8 @@ class CoralGatewayMiddleware:
         self._log_entry({
             "request_id": request_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ts_start": ts_start_ns / 1e9,
+            "ts_end": ts_end_ns / 1e9,
             "agent_id": agent_id,
             "session_id": session_id,
             "method": method,
@@ -209,7 +213,9 @@ class CoralGatewayMiddleware:
             "response": _assemble_response(b"".join(response_body_parts)),
             "status_code": response_status,
             "duration_ms": duration_ms,
-            "t2t_latency_s": round(t2t_latency_s, 6),
+            # Preserve the full timer value.  Step3 reports sub-millisecond
+            # client_overhead, so rounding here would destroy the signal.
+            "t2t_latency_s": t2t_latency_s,
         })
 
         return None

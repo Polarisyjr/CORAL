@@ -10,6 +10,7 @@ import os
 import signal
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,18 @@ from coral.workspace import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _PendingResume:
+    """An interrupt requested by the monitor but not yet safe to resume."""
+
+    prompt: str
+    prompt_source: str | None
+    requested_at: float
+    deadline: float
+    mode: str
+    phase: str = "requested"
+
+
 class AgentManager:
     """Manage the lifecycle of multiple CORAL agents."""
 
@@ -62,6 +75,7 @@ class AgentManager:
         self._stopping = False
         self._start_time: datetime | None = None
         self._restart_counts: dict[str, int] = {}
+        self._pending_resumes: dict[str, _PendingResume] = {}
         self._agent_eval_counts: dict[str, int] = {}
         self._agent_best_scores: dict[str, float] = {}
         self._agent_evals_since_improvement: dict[str, int] = {}
@@ -81,6 +95,15 @@ class AgentManager:
     def _turn_budget_exhausted(self) -> bool:
         limit = self.config.agents.max_total_turns
         return limit > 0 and self._turn_count() >= limit
+
+    def _turn_budget_has_capacity(self) -> bool:
+        """Whether another invocation can be started or reserved.
+
+        Pending safe-boundary stops reserve their future resume slot so another
+        agent cannot consume the shared budget while they are still running.
+        """
+        limit = self.config.agents.max_total_turns
+        return limit <= 0 or self._turn_count() + len(self._pending_resumes) < limit
 
     def _recording_manifest_enabled(self) -> bool:
         return not self.config.agents.restart_exited or self.config.agents.max_total_turns > 0
@@ -472,6 +495,86 @@ class AgentManager:
             prompt_source=prompt_source,
         )
 
+    def _schedule_interrupt_and_resume(
+        self, idx: int, prompt: str,
+        prompt_source: str | None = None,
+    ) -> bool:
+        """Request an interrupt and let the monitor resume it asynchronously.
+
+        A second heartbeat for an already-pending agent updates the feedback
+        that will be delivered on resume instead of consuming another turn.
+        """
+        handle = self.handles[idx]
+        agent_id = handle.agent_id
+        existing = self._pending_resumes.get(agent_id)
+        if existing is not None:
+            existing.prompt = prompt
+            existing.prompt_source = prompt_source
+            logger.info(f"Updated pending resume feedback for {agent_id}")
+            return True
+
+        if not self._turn_budget_has_capacity():
+            return False
+
+        requested_at = time.monotonic()
+        mode = handle.request_interrupt(
+            at_turn_boundary=self.config.agents.max_total_turns > 0,
+        )
+        timeout = 900.0 if mode == "turn-boundary" else 15.0
+        if mode == "already-exited":
+            timeout = 0.0
+        self._pending_resumes[agent_id] = _PendingResume(
+            prompt=prompt,
+            prompt_source=prompt_source,
+            requested_at=requested_at,
+            deadline=requested_at + timeout,
+            mode=mode,
+        )
+        logger.info(f"Scheduled non-blocking {mode} resume for {agent_id}")
+        return True
+
+    def _advance_pending_resumes(self) -> None:
+        """Poll requested interrupts, escalating or resuming without blocking."""
+        now = time.monotonic()
+        for idx, handle in enumerate(self.handles):
+            pending = self._pending_resumes.get(handle.agent_id)
+            if pending is None:
+                continue
+
+            if not handle.alive:
+                elapsed = now - pending.requested_at
+                logger.info(
+                    f"Agent {handle.agent_id} exited after asynchronous "
+                    f"{pending.mode} stop ({elapsed:.1f}s); resuming"
+                )
+                del self._pending_resumes[handle.agent_id]
+                self.handles[idx] = self._restart_agent(
+                    idx,
+                    prompt=pending.prompt,
+                    prompt_source=pending.prompt_source,
+                )
+                self._write_agent_pids()
+                continue
+
+            if now < pending.deadline:
+                continue
+
+            if pending.phase == "requested":
+                logger.warning(
+                    f"Agent {handle.agent_id} didn't complete its asynchronous "
+                    f"{pending.mode} stop; sending SIGTERM"
+                )
+                handle.signal_process_group(signal.SIGTERM)
+                pending.phase = "terminating"
+                pending.deadline = now + 5.0
+            else:
+                logger.warning(
+                    f"Agent {handle.agent_id} ignored SIGTERM; sending SIGKILL"
+                )
+                handle.signal_process_group(signal.SIGKILL)
+                pending.phase = "killing"
+                pending.deadline = now + 5.0
+
     def resume_all(self, paths: ProjectPaths, instruction: str | None = None) -> list[AgentHandle]:
         """Resume agents into an existing run's worktrees."""
         self._start_time = datetime.now(UTC)
@@ -827,6 +930,11 @@ class AgentManager:
         logger.info(f"Monitoring {len(self.handles)} agent(s) (check every {check_interval}s)...")
 
         while self._running:
+            # Heartbeat and timeout interrupts are requested without waiting.
+            # Reap and resume any that reached a safe boundary since the last
+            # tick before processing new events or ordinary dead agents.
+            self._advance_pending_resumes()
+
             # Check for new attempts
             current_attempts = self._get_seen_attempts()
             new_attempts = current_attempts - seen_attempts
@@ -923,7 +1031,11 @@ class AgentManager:
 
                     combined_prompt = "\n\n".join(prompts)
                     names = ", ".join(action_names)
-                    if self._turn_budget_exhausted():
+                    scheduled = self._schedule_interrupt_and_resume(
+                        committing_idx, combined_prompt,
+                        prompt_source=f"heartbeat:{names}",
+                    )
+                    if not scheduled:
                         logger.info(
                             f"Heartbeat [{names}] skipped: shared turn budget exhausted"
                         )
@@ -934,19 +1046,19 @@ class AgentManager:
                     )
                     if self.verbose:
                         print(f"\n[coral] Agent eval #{agent_eval_count}: score={attempt_data.get('score', '?')}")
-                        print(f"[coral] Interrupting {committing_agent_id} for {names}...\n")
-                    self.handles[committing_idx] = self._interrupt_and_resume(
-                        committing_idx, combined_prompt,
-                        prompt_source=f"heartbeat:{names}",
-                    )
-                    self._write_agent_pids()
+                        print(
+                            f"[coral] Interrupting {committing_agent_id} for {names}; "
+                            "monitoring continues...\n"
+                        )
 
             # Check for dead agents (max-turns exit, crash, etc.)
             for i, handle in enumerate(self.handles):
                 if not handle.alive and self._running:
+                    if handle.agent_id in self._pending_resumes:
+                        continue
                     if not self.config.agents.restart_exited:
                         continue
-                    if self._turn_budget_exhausted():
+                    if not self._turn_budget_has_capacity():
                         continue
                     exit_code = handle.process.returncode if handle.process else None
                     count = self._restart_counts.get(handle.agent_id, 0) + 1
@@ -996,12 +1108,14 @@ class AgentManager:
             if timeout > 0:
                 for i, handle in enumerate(self.handles):
                     if handle.alive and self._running:
+                        if handle.agent_id in self._pending_resumes:
+                            continue
                         try:
                             age = time.time() - handle.log_path.stat().st_mtime
                         except OSError:
                             continue
                         if age > timeout:
-                            if self._turn_budget_exhausted():
+                            if not self._turn_budget_has_capacity():
                                 logger.info(
                                     f"Stalled-agent restart skipped for {handle.agent_id}: "
                                     "shared turn budget exhausted"
@@ -1023,7 +1137,7 @@ class AgentManager:
                                     f"[coral] {handle.agent_id} stalled "
                                     f"({int(age)}s with no output), restarting..."
                                 )
-                            self.handles[i] = self._interrupt_and_resume(
+                            self._schedule_interrupt_and_resume(
                                 i,
                                 "You were automatically restarted because you "
                                 "produced no output for an extended period. "

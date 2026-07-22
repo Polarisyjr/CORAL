@@ -4,13 +4,14 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 from coral.agent.builtin.opencode import (
     _install_signal_safe_shell,
     _is_completed_turn,
     _tee_and_limit,
 )
-from coral.agent.runtime import _extract_session_id
+from coral.agent.runtime import AgentHandle, _extract_session_id
 
 
 def test_completed_turn_only_accepts_step_finish_json() -> None:
@@ -73,6 +74,31 @@ def test_stream_stops_only_after_completed_turn_boundary(tmp_path) -> None:
         "tool_use",
         "step_finish",
     ]
+
+
+def test_turn_boundary_interrupt_request_does_not_wait(tmp_path) -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        start_new_session=True,
+    )
+    requested = threading.Event()
+    handle = AgentHandle(
+        agent_id="agent-1",
+        process=process,
+        worktree_path=tmp_path,
+        log_path=tmp_path / "agent-1.0.log",
+        _request_turn_boundary_stop=requested.set,
+    )
+
+    started = time.monotonic()
+    try:
+        assert handle.request_interrupt(at_turn_boundary=True) == "turn-boundary"
+        assert time.monotonic() - started < 0.5
+        assert requested.is_set()
+        assert handle.alive
+    finally:
+        handle.signal_process_group(signal.SIGKILL)
+        process.wait(timeout=2)
 
 
 def test_generic_session_extractor_accepts_opencode_spelling(tmp_path) -> None:

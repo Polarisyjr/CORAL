@@ -65,7 +65,7 @@ class AgentHandle:
     log_path: Path
     session_id: str | None = None
     recording_data_path: Path | None = None
-    _log_file: object | None = None  # keep reference to prevent GC closing the file
+    _log_file: IO[str] | None = None  # keep reference to prevent GC closing the file
     _request_turn_boundary_stop: Callable[[], None] | None = None
 
     @property
@@ -119,6 +119,41 @@ class AgentHandle:
         except (ProcessLookupError, PermissionError):
             self.process.send_signal(sig)
 
+    def request_interrupt(self, *, at_turn_boundary: bool = False) -> str:
+        """Request an interrupt without waiting for the process to exit.
+
+        Returns the requested stop mode.  Managers can poll ``alive`` and resume
+        the agent later without blocking health checks for the rest of the team.
+        """
+        if not self.process or not self.alive:
+            return "already-exited"
+
+        pid = self.process.pid
+        boundary_callback = self._request_turn_boundary_stop
+        if at_turn_boundary and boundary_callback is not None:
+            logger.info(
+                f"Stopping agent {self.agent_id} (PID {pid}) at next turn boundary"
+            )
+            boundary_callback()
+            return "turn-boundary"
+
+        logger.info(f"Interrupting agent {self.agent_id} (PID {pid}) with SIGINT")
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGINT)
+        except (ProcessLookupError, PermissionError):
+            self.process.send_signal(signal.SIGINT)
+        return "sigint"
+
+    def finish_interrupt(self) -> str | None:
+        """Close resources and extract the session after an interrupt completes."""
+        self._close_pipes()
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+        return _extract_session_id(self.log_path)
+
     def interrupt(self, *, at_turn_boundary: bool = False) -> str | None:
         """Interrupt a running agent via SIGINT (like Ctrl+C).
 
@@ -130,21 +165,8 @@ class AgentHandle:
         if not self.process or not self.alive:
             return _extract_session_id(self.log_path)
 
-        pid = self.process.pid
-        boundary_stop = at_turn_boundary and self._request_turn_boundary_stop is not None
-        if boundary_stop:
-            logger.info(
-                f"Stopping agent {self.agent_id} (PID {pid}) at next turn boundary"
-            )
-            self._request_turn_boundary_stop()
-        else:
-            logger.info(f"Interrupting agent {self.agent_id} (PID {pid}) with SIGINT")
-
-            # Send SIGINT to process group (same as Ctrl+C)
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGINT)
-            except (ProcessLookupError, PermissionError):
-                self.process.send_signal(signal.SIGINT)
+        mode = self.request_interrupt(at_turn_boundary=at_turn_boundary)
+        boundary_stop = mode == "turn-boundary"
 
         # Wait for graceful exit
         try:
@@ -167,14 +189,7 @@ class AgentHandle:
                 self.process.kill()
                 self.process.wait()
 
-        self._close_pipes()
-        if self._log_file:
-            try:
-                self._log_file.close()
-            except Exception:
-                pass
-
-        return _extract_session_id(self.log_path)
+        return self.finish_interrupt()
 
     def __del__(self) -> None:
         """Safety net: ensure process and file handles are cleaned up on GC."""
