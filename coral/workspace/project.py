@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,19 @@ def slugify(name: str) -> str:
 
 _SEED_SKILLS_DIR = Path(__file__).parent.parent / "template" / "skills"
 _SEED_AGENTS_DIR = Path(__file__).parent.parent / "template" / "agents"
+
+
+def _replace_latest_symlink(task_dir: Path, run_dir: Path) -> None:
+    """Atomically publish the latest run when task launches overlap."""
+
+    latest_link = task_dir / "latest"
+    temporary = task_dir / f".latest-{uuid.uuid4().hex}"
+    rel = os.path.relpath(run_dir, task_dir)
+    try:
+        temporary.symlink_to(rel)
+        os.replace(temporary, latest_link)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def create_project(config: CoralConfig, config_dir: Path | None = None) -> ProjectPaths:
@@ -133,13 +147,8 @@ def create_project(config: CoralConfig, config_dir: Path | None = None) -> Proje
     (coral_dir / "config_dir").write_text(str(effective_config_dir))
 
     # Create/update "latest" symlink at task_dir/latest -> this run directory
-    latest_link = task_dir / "latest"
-    if latest_link.is_symlink():
-        latest_link.unlink()
-    if not latest_link.exists():
-        rel = os.path.relpath(run_dir, task_dir)
-        latest_link.symlink_to(rel)
-        logger.info(f"Symlinked {latest_link} -> {rel}")
+    _replace_latest_symlink(task_dir, run_dir)
+    logger.info(f"Symlinked {task_dir / 'latest'} -> {os.path.relpath(run_dir, task_dir)}")
 
     # Clone source repo into run_dir/repo/
     repo_dir = clone_or_init_repo(source_repo, run_repo)

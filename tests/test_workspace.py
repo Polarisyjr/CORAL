@@ -3,6 +3,7 @@
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from coral.workspace import (
     setup_worktree_env,
     write_agent_id,
 )
+from coral.workspace.project import _replace_latest_symlink
 
 
 def _make_config(repo_path: str, results_dir: str | None = None) -> CoralConfig:
@@ -82,6 +84,21 @@ def test_create_project_unique_runs():
         # latest should point to the second run directory
         latest = paths1.task_dir / "latest"
         assert latest.resolve() == paths2.run_dir.resolve()
+
+
+def test_latest_symlink_update_is_safe_for_concurrent_runs(tmp_path: Path) -> None:
+    task_dir = tmp_path / "task"
+    run_dirs = [task_dir / f"run-{index}" for index in range(16)]
+    for run_dir in run_dirs:
+        run_dir.mkdir(parents=True)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda run_dir: _replace_latest_symlink(task_dir, run_dir), run_dirs))
+
+    latest = task_dir / "latest"
+    assert latest.is_symlink()
+    assert latest.resolve() in {run_dir.resolve() for run_dir in run_dirs}
+    assert not list(task_dir.glob(".latest-*"))
 
 
 def test_write_agent_id():
@@ -166,5 +183,4 @@ def test_create_project_setup_runs_sequentially():
         result_file = worktree / "mydir" / "result.txt"
         assert result_file.exists()
         assert result_file.read_text().strip() == "done"
-
 
